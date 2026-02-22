@@ -35,3 +35,11 @@ app.include_router(portfolio_router)
 @app.get("/version", tags=["meta"])
 def version():
     return {"version": app.version, "service": app.title}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"message": "Service is running. Go to /docs"}
