@@ -5,9 +5,10 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from app.db.session import get_db
 from app.db.models import WorkItem
-from app.core.decision_engine import decide_shipment_delay
 from app.db.models import Decision
 from sqlalchemy import select
+from app.core.orchestrator import orchestrate
+from app.core.scenarios import SCENARIOS
 
 router = APIRouter(prefix="/work-items", tags=["work-items"])
 
@@ -87,10 +88,20 @@ def run_work_item(work_item_id: str, db: Session = Depends(get_db)):
     if not wi:
         raise HTTPException(status_code=404, detail="WorkItem not found")
 
-    decision, reason, confidence = decide_shipment_delay(wi.payload)
+    # ---- MULTI-AGENT ORCHESTRATION ----
+    out = orchestrate(wi.payload)
 
+    decision = out["decision"]
+    reason = out["reason"]
+    confidence = float(out["confidence"])
+
+    # Store explainability trace in context
+    wi.context = out["context"]
+
+    # Update status
     wi.status = "AUTO_RESOLVED" if decision == "AUTO_RESOLVE" else "ESCALATED"
 
+    # Persist decision record
     d = Decision(
         work_item_id=wi.id,
         decision=decision,
@@ -108,8 +119,8 @@ def run_work_item(work_item_id: str, db: Session = Depends(get_db)):
         "decision": decision,
         "reason": reason,
         "confidence": confidence,
+        "agent_summary": wi.context["final"],
     }
-
 
 class HumanReviewRequest(BaseModel):
     action: str = Field(..., pattern="^(APPROVE|REJECT)$")
@@ -205,3 +216,73 @@ def get_work_item_trace(work_item_id: str, db: Session = Depends(get_db)):
             for d in decisions
         ],
     )
+
+@router.post("/simulate")
+def simulate(db: Session = Depends(get_db)):
+    """
+    Runs a fixed scenario set through the orchestrator and stores results.
+    Returns business metrics to tell a strong story in interviews.
+    """
+    results = []
+    auto_resolved = 0
+    escalated = 0
+
+    for ev in SCENARIOS:
+        out = orchestrate(ev)
+
+        decision = out["decision"]
+        status = "AUTO_RESOLVED" if decision == "AUTO_RESOLVE" else "ESCALATED"
+        if status == "AUTO_RESOLVED":
+            auto_resolved += 1
+        else:
+            escalated += 1
+
+        wi = WorkItem(
+            type="SHIPMENT_DELAY",
+            status=status,
+            payload=ev,
+            context=out["context"],
+        )
+        db.add(wi)
+        db.flush()  # get wi.id without committing yet
+
+        d = Decision(
+            work_item_id=wi.id,
+            decision=decision,
+            reason=out["reason"],
+            confidence=float(out["confidence"]),
+        )
+        db.add(d)
+
+        results.append(
+            {
+                "work_item_id": str(wi.id),
+                "shipment_id": ev["shipment_id"],
+                "status": status,
+                "decision": decision,
+                "confidence": out["confidence"],
+                "votes_escalate": out["context"]["final"]["votes_escalate"],
+            }
+        )
+
+    db.commit()
+
+    total = len(SCENARIOS)
+    auto_rate = round(auto_resolved / total, 3)
+    esc_rate = round(escalated / total, 3)
+
+    # Simple business impact story (conservative assumptions)
+    # Assumption: each escalated case takes 15 min of analyst time.
+    # Auto-resolve saves that time. Convert to hours.
+    minutes_saved = auto_resolved * 15
+    hours_saved = round(minutes_saved / 60.0, 2)
+
+    return {
+        "total": total,
+        "auto_resolved": auto_resolved,
+        "escalated": escalated,
+        "auto_resolve_rate": auto_rate,
+        "escalation_rate": esc_rate,
+        "estimated_hours_saved_per_run": hours_saved,
+        "items": results,
+    }
