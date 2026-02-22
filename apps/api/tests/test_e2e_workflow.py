@@ -1,3 +1,4 @@
+import os
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -72,21 +73,51 @@ def test_multi_agent_orchestrator_trace(event, expected_status, expected_reason_
     ctx = t["work_item"]["context"]
     assert ctx is not None
 
-    # validate agent trace
-    agent_trace = ctx["agent_trace"]
+    # -----------------------------
+    # validate agent trace (robust)
+    # -----------------------------
+    agent_trace = ctx.get("agent_trace")
     assert isinstance(agent_trace, list)
-    assert len(agent_trace) == 4
 
-    names = sorted([a["name"] for a in agent_trace])
-    assert names == ["CostAgent", "LlmDecisionAgent", "RiskAgent", "SlaAgent"]
+    names = sorted([a.get("name") for a in agent_trace if isinstance(a, dict) and a.get("name")])
 
+    # deterministic agents must always exist
+    for must in ["CostAgent", "RiskAgent", "SlaAgent"]:
+        assert must in names
+
+    # LLM agent may be present or may be skipped in CI (no OPENAI_API_KEY)
+    llm_present = "LlmDecisionAgent" in names
+
+    # If LLM is present, we should have exactly 4 agents with the expected names
+    if llm_present:
+        assert len(names) == 4
+        assert names == ["CostAgent", "LlmDecisionAgent", "RiskAgent", "SlaAgent"]
+    else:
+        # If LLM is absent, we should have exactly 3 deterministic agents
+        assert len(names) == 3
+        assert names == ["CostAgent", "RiskAgent", "SlaAgent"]
+
+    # -----------------------------
     # validate final summary exists
-    final = ctx["final"]
+    # -----------------------------
+    final = ctx.get("final")
+    assert isinstance(final, dict)
+
     assert "decision" in final
-    assert "weighted_escalate_score" in final
     assert "avg_score" in final
 
+    # Your orchestrator currently uses weighted_escalate_score; older test used votes_escalate
+    assert "weighted_escalate_score" in final
+
+    # Optional but useful: if your backend exposes this, validate it
+    # (won't fail if you haven't implemented it)
+    # if "llm_enabled" in final:
+    #     assert isinstance(final["llm_enabled"], bool)
+
+    # -----------------------------------------
     # validate decision record reason formatting
-    decisions = t["decisions"]
+    # -----------------------------------------
+    decisions = t.get("decisions")
+    assert isinstance(decisions, list)
     assert len(decisions) >= 1
     assert decisions[0]["reason"].startswith(expected_reason_prefix)
