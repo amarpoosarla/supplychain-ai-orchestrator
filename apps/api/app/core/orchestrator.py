@@ -5,7 +5,7 @@ def orchestrate(event: dict) -> dict:
     agents = [RiskAgent(), CostAgent(), SlaAgent()]
     results: list[AgentResult] = [a.evaluate(event) for a in agents]
 
-    # Hard override: priority shipments must escalate
+    # Hard override 1: priority shipments must escalate
     if bool(event.get("priority_flag", False)):
         avg_score = sum(r.score for r in results) / len(results)
 
@@ -29,6 +29,41 @@ def orchestrate(event: dict) -> dict:
                 "votes_escalate": len(results),
                 "avg_score": avg_score,
                 "override": "PRIORITY_FLAG",
+            },
+        }
+
+        return {
+            "decision": "ESCALATE",
+            "reason": reason,
+            "confidence": 1.0,
+            "context": context,
+        }
+
+    # Hard override 2: very high value orders must escalate
+    order_value = float(event.get("order_value", 0.0))
+    if order_value >= 100000:
+        avg_score = sum(r.score for r in results) / len(results)
+
+        key_reasons = [r.reason for r in results if r.recommendation == "ESCALATE"]
+        reason = f"Escalated because: high order value (order_value={order_value})"
+        if key_reasons:
+            reason += " | " + " | ".join(key_reasons)
+
+        context = {
+            "agent_trace": [
+                {
+                    "name": r.name,
+                    "score": r.score,
+                    "recommendation": r.recommendation,
+                    "reason": r.reason,
+                }
+                for r in results
+            ],
+            "final": {
+                "decision": "ESCALATE",
+                "votes_escalate": len(results),
+                "avg_score": avg_score,
+                "override": "HIGH_ORDER_VALUE",
             },
         }
 
