@@ -1,8 +1,21 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { ShipmentDelayEvent, TraceResponse, WorkItemResponse, RunWorkItemResponse } from "@/lib/api";
-import { createWorkItem, runWorkItem, getTrace } from "@/lib/api";
+import type {
+  ShipmentDelayEvent,
+  TraceResponse,
+  WorkItemResponse,
+  RunWorkItemResponse,
+  SimulationsReport,
+} from "@/lib/api";
+import {
+  createWorkItem,
+  runWorkItem,
+  getTrace,
+  runSimulations,
+  getSimulationsReport,
+  resetSimulations,
+} from "@/lib/api";
 
 const defaultEvent: ShipmentDelayEvent = {
   shipment_id: "SIM-9999",
@@ -16,11 +29,19 @@ const defaultEvent: ShipmentDelayEvent = {
   priority_flag: false,
 };
 
-type AgentTraceRow = {
+type AgentTraceItem = {
   name: string;
   score: number;
-  recommendation: string;
+  recommendation: "ESCALATE" | "AUTO_RESOLVE" | string;
   reason: string;
+};
+
+type FinalSummary = {
+  decision?: string;
+  avg_score?: number;
+  votes_escalate?: number;
+  weighted_escalate_score?: number;
+  override?: string;
 };
 
 function clamp01(n: number) {
@@ -29,39 +50,34 @@ function clamp01(n: number) {
 }
 
 function fmtPct(n: number) {
-  const v = Math.round(clamp01(n) * 100);
-  return `${v}%`;
+  const x = clamp01(n);
+  return `${Math.round(x * 100)}%`;
 }
 
-function decisionBadgeClasses(decision: string) {
+function decisionBadge(decision?: string) {
   const d = (decision || "").toUpperCase();
-  if (d === "ESCALATE") return "bg-red-500/15 text-red-200 ring-1 ring-red-500/30";
-  if (d === "AUTO_RESOLVE") return "bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/30";
-  return "bg-slate-500/15 text-slate-200 ring-1 ring-slate-500/30";
+  if (d === "ESCALATE") return "bg-red-500/15 text-red-300 border-red-500/30";
+  if (d === "AUTO_RESOLVE") return "bg-emerald-500/15 text-emerald-300 border-emerald-500/30";
+  return "bg-slate-500/15 text-slate-300 border-slate-500/30";
 }
 
-function confidenceBarClasses(confidence: number) {
-  const c = clamp01(confidence);
-  if (c >= 0.75) return "bg-red-500";
-  if (c >= 0.4) return "bg-amber-400";
-  return "bg-emerald-500";
-}
-
-function recChipClasses(rec: string) {
+function recBadge(rec?: string) {
   const r = (rec || "").toUpperCase();
-  if (r === "ESCALATE") return "bg-red-500/15 text-red-200 ring-1 ring-red-500/30";
-  if (r === "AUTO_RESOLVE") return "bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/30";
-  return "bg-slate-500/15 text-slate-200 ring-1 ring-slate-500/30";
+  if (r === "ESCALATE") return "bg-red-500/15 text-red-300 border-red-500/30";
+  if (r === "AUTO_RESOLVE") return "bg-emerald-500/15 text-emerald-300 border-emerald-500/30";
+  return "bg-slate-500/15 text-slate-300 border-slate-500/30";
 }
 
-function parseAgentTrace(trace: TraceResponse | null): AgentTraceRow[] {
-  const ctx = trace?.work_item?.context;
-  const rows: AgentTraceRow[] | undefined = ctx?.agent_trace;
-  if (Array.isArray(rows)) return rows;
-  // fallback: sometimes trace is nested
-  const maybe = ctx?.agent_trace || ctx?.final?.agent_trace;
-  if (Array.isArray(maybe)) return maybe;
-  return [];
+function scoreBarColor(score: number) {
+  const s = clamp01(score);
+  if (s >= 0.8) return "bg-emerald-500";
+  if (s >= 0.5) return "bg-amber-500";
+  return "bg-red-500";
+}
+
+function num(n: any): number {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : 0;
 }
 
 export default function WorkItemsPage() {
@@ -74,19 +90,14 @@ export default function WorkItemsPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Metrics state
+  const [metricsBusy, setMetricsBusy] = useState(false);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<SimulationsReport | null>(null);
+
   function setField<K extends keyof ShipmentDelayEvent>(key: K, value: ShipmentDelayEvent[K]) {
     setEvent((prev) => ({ ...prev, [key]: value }));
   }
-
-  const agentTrace = useMemo(() => parseAgentTrace(trace), [trace]);
-
-  const finalSummary = useMemo(() => {
-    // runResult.agent_summary is what your backend returns
-    // trace.work_item.context.final is also available
-    const rr = runResult?.agent_summary;
-    const ctxFinal = (trace?.work_item?.context as any)?.final;
-    return rr || ctxFinal || null;
-  }, [runResult, trace]);
 
   async function onCreate() {
     setError(null);
@@ -133,359 +144,488 @@ export default function WorkItemsPage() {
     }
   }
 
+  async function onRefreshMetrics() {
+    setMetricsError(null);
+    setMetricsBusy(true);
+    try {
+      const r = await getSimulationsReport();
+      setMetrics(r);
+    } catch (e: any) {
+      setMetricsError(e?.message || "Metrics fetch failed");
+    } finally {
+      setMetricsBusy(false);
+    }
+  }
+
+  async function onRunSimulations() {
+    setMetricsError(null);
+    setMetricsBusy(true);
+    try {
+      // backend: POST /work-items/simulate
+      await runSimulations();
+      const r = await getSimulationsReport();
+      setMetrics(r);
+    } catch (e: any) {
+      setMetricsError(e?.message || "Simulation failed");
+    } finally {
+      setMetricsBusy(false);
+    }
+  }
+
+  async function onResetMetrics() {
+    setMetricsError(null);
+    setMetricsBusy(true);
+    try {
+      // backend: DELETE /work-items/simulations/reset
+      await resetSimulations();
+      const r = await getSimulationsReport();
+      setMetrics(r);
+    } catch (e: any) {
+      setMetricsError(e?.message || "Reset failed");
+    } finally {
+      setMetricsBusy(false);
+    }
+  }
+
+  // ---- Extract explainability context safely ----
+  const ctx = trace?.work_item?.context as any | undefined;
+  const finalSummary: FinalSummary | undefined = ctx?.final;
+  const agentTrace: AgentTraceItem[] = (ctx?.agent_trace || []) as AgentTraceItem[];
+
+  const finalDecision = useMemo(() => {
+    const dFromRun = runResult?.decision;
+    const dFromTrace = finalSummary?.decision;
+    return (dFromRun || dFromTrace || "").toUpperCase();
+  }, [runResult?.decision, finalSummary?.decision]);
+
+  const override = finalSummary?.override;
+
+  const overrideBreakdownEntries = useMemo(() => {
+    const ob = metrics?.override_breakdown || {};
+    return Object.entries(ob).sort((a, b) => b[1] - a[1]);
+  }, [metrics?.override_breakdown]);
+
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
-      {/* Top bar */}
-      <header className="border-b border-white/10 bg-slate-950/60 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
+      <div className="mx-auto max-w-6xl px-6 py-10">
+        <div className="flex items-start justify-between gap-6">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight">Supply Chain AI Orchestrator</h1>
-            <p className="mt-1 text-sm text-slate-300">
-              Multi-agent decisioning with RAG and full traceability.
+            <h1 className="text-2xl font-semibold tracking-tight">Work Items</h1>
+            <p className="mt-2 text-sm text-slate-300">
+              Create a shipment delay event, run orchestration, and inspect explainability trace.
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
-            <span className="hidden rounded-full bg-indigo-500/15 px-3 py-1 text-xs text-indigo-200 ring-1 ring-indigo-500/30 md:inline">
-              Portfolio Mode
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-400">API</span>
+            <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-200">
+              {process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000"}
             </span>
-
-            <a
-              className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200 hover:bg-white/10"
-              href="/"
-            >
-              Home
-            </a>
           </div>
         </div>
-      </header>
 
-      <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-6 lg:grid-cols-12">
-        {/* Left: Form */}
-        <section className="lg:col-span-5">
-          <Card>
-            <CardHeader
-              title="Create Work Item"
-              subtitle="Enter a shipment delay event. This creates a new work item in Postgres."
-            />
-            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <TextField
-                label="shipment_id"
-                value={event.shipment_id}
-                onChange={(v) => setField("shipment_id", v)}
-              />
-              <TextField
-                label="supplier_id"
-                value={event.supplier_id}
-                onChange={(v) => setField("supplier_id", v)}
-              />
+        {error && (
+          <div className="mt-6 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+            <div className="text-sm">
+              <span className="font-semibold text-red-200">Error:</span>{" "}
+              <span className="text-red-100">{error}</span>
+            </div>
+          </div>
+        )}
 
-              <TextField
-                label="original_eta"
-                value={event.original_eta}
-                onChange={(v) => setField("original_eta", v)}
-              />
-              <TextField
-                label="updated_eta"
-                value={event.updated_eta}
-                onChange={(v) => setField("updated_eta", v)}
-              />
+        {/* Top status banner */}
+        {(runResult || trace) && (
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <span
+                  className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium ${decisionBadge(finalDecision)}`}
+                >
+                  {finalDecision || "NO_DECISION"}
+                </span>
 
-              <NumberField
-                label="delay_days"
-                value={event.delay_days}
-                onChange={(v) => setField("delay_days", v)}
-              />
-              <NumberField
-                label="inventory_days_of_supply"
-                value={event.inventory_days_of_supply}
-                onChange={(v) => setField("inventory_days_of_supply", v)}
-              />
+                {override && (
+                  <span className="inline-flex items-center rounded-full border border-violet-500/30 bg-violet-500/10 px-3 py-1 text-xs font-medium text-violet-200">
+                    Override: {override}
+                  </span>
+                )}
 
-              <NumberField
-                label="order_value"
-                value={event.order_value}
-                onChange={(v) => setField("order_value", v)}
-              />
-              <TextField label="region" value={event.region} onChange={(v) => setField("region", v)} />
+                {created?.id && (
+                  <span className="text-xs text-slate-400">
+                    WorkItem: <span className="text-slate-200">{created.id}</span>
+                  </span>
+                )}
+              </div>
 
-              <div className="sm:col-span-2">
-                <Toggle
-                  label="priority_flag"
-                  checked={event.priority_flag}
-                  onChange={(v) => setField("priority_flag", v)}
-                />
+              <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+                {runResult?.new_status && (
+                  <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">
+                    Status: <span className="text-slate-100">{runResult.new_status}</span>
+                  </span>
+                )}
+                {typeof runResult?.confidence === "number" && (
+                  <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">
+                    Confidence: <span className="text-slate-100">{fmtPct(runResult.confidence)}</span>
+                  </span>
+                )}
+                {typeof finalSummary?.avg_score === "number" && (
+                  <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1">
+                    Avg score: <span className="text-slate-100">{finalSummary.avg_score.toFixed(3)}</span>
+                  </span>
+                )}
               </div>
             </div>
 
-            <div className="mt-6 flex flex-wrap gap-3">
-              <PrimaryButton onClick={onCreate} disabled={busy}>
-                {busy ? "Working..." : "Create Work Item"}
-              </PrimaryButton>
-
-              <SecondaryButton onClick={onRun} disabled={busy || !created?.id}>
-                {busy ? "Working..." : "Run Orchestration"}
-              </SecondaryButton>
-
-              <SecondaryButton onClick={onRefreshTrace} disabled={busy || !created?.id}>
-                Refresh Trace
-              </SecondaryButton>
-            </div>
-
-            {error && (
-              <div className="mt-5 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-100">
-                <div className="font-semibold">Error</div>
-                <div className="mt-1 break-words text-red-100/90">{error}</div>
+            {runResult?.reason && (
+              <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <div className="text-xs uppercase tracking-wide text-slate-400">Reason</div>
+                <div className="mt-1 text-sm text-slate-100">{runResult.reason}</div>
               </div>
             )}
+          </div>
+        )}
 
-            {created?.id && (
-              <div className="mt-5 rounded-xl border border-white/10 bg-white/5 p-4">
-                <div className="text-sm text-slate-300">Created Work Item</div>
-                <div className="mt-1 break-all font-mono text-sm text-slate-100">{created.id}</div>
-                <div className="mt-2 text-sm text-slate-300">
-                  Status: <span className="text-slate-100">{created.status}</span>
+        {/* Create Work Item */}
+        <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-base font-semibold">1) Create Work Item</h2>
+
+            <div className="flex gap-2">
+              <button
+                onClick={onCreate}
+                disabled={busy}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-100 hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {busy ? "Working..." : "Create"}
+              </button>
+
+              <button
+                onClick={onRun}
+                disabled={busy || !created?.id}
+                className="rounded-xl border border-slate-700 bg-indigo-600/20 px-4 py-2 text-sm text-indigo-100 hover:bg-indigo-600/30 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {busy ? "Working..." : "Run Orchestration"}
+              </button>
+
+              <button
+                onClick={onRefreshTrace}
+                disabled={busy || !created?.id}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-100 hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Refresh Trace
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <TextInput label="shipment_id" value={event.shipment_id} onChange={(v) => setField("shipment_id", v)} />
+            <TextInput label="supplier_id" value={event.supplier_id} onChange={(v) => setField("supplier_id", v)} />
+
+            <TextInput label="original_eta" value={event.original_eta} onChange={(v) => setField("original_eta", v)} />
+            <TextInput label="updated_eta" value={event.updated_eta} onChange={(v) => setField("updated_eta", v)} />
+
+            <NumberInput label="delay_days" value={event.delay_days} onChange={(v) => setField("delay_days", v)} />
+            <NumberInput
+              label="inventory_days_of_supply"
+              value={event.inventory_days_of_supply}
+              onChange={(v) => setField("inventory_days_of_supply", v)}
+            />
+
+            <NumberInput label="order_value" value={event.order_value} onChange={(v) => setField("order_value", v)} />
+            <TextInput label="region" value={event.region} onChange={(v) => setField("region", v)} />
+
+            <div className="md:col-span-2">
+              <Toggle
+                label="priority_flag"
+                checked={event.priority_flag}
+                onChange={(v) => setField("priority_flag", v)}
+              />
+            </div>
+          </div>
+
+          {created?.id && (
+            <div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="text-slate-400">Created Work Item ID:</span>{" "}
+                  <span className="font-medium text-slate-100">{created.id}</span>
+                </div>
+                <div className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-200">
+                  Status: {created.status}
                 </div>
               </div>
-            )}
-          </Card>
-
-          <Card className="mt-6">
-            <CardHeader title="Tips" subtitle="Quick checks when wiring frontend to backend." />
-            <ul className="mt-4 space-y-2 text-sm text-slate-300">
-              <li className="flex gap-2">
-                <span className="mt-[2px] h-2 w-2 rounded-full bg-emerald-400/80" />
-                Backend: <span className="text-slate-200">http://localhost:8000</span>
-              </li>
-              <li className="flex gap-2">
-                <span className="mt-[2px] h-2 w-2 rounded-full bg-indigo-400/80" />
-                If you see <span className="text-slate-200">OPTIONS 405</span>, you are hitting the API from the browser and need CORS.
-              </li>
-              <li className="flex gap-2">
-                <span className="mt-[2px] h-2 w-2 rounded-full bg-amber-400/80" />
-                Use <span className="text-slate-200">/work-items/{`{id}`}/trace</span> to show explainability.
-              </li>
-            </ul>
-          </Card>
+            </div>
+          )}
         </section>
 
-        {/* Right: Decision + Trace */}
-        <section className="lg:col-span-7">
-          <Card>
-            <CardHeader title="Decision Panel" subtitle="Latest orchestration outcome with confidence and explanation." />
+        {/* Executive Metrics */}
+        <section className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold">Executive Metrics</h2>
+              <p className="mt-1 text-sm text-slate-300">
+                Business outcome view from simulation runs (auto-resolve rate, escalation rate, override mix).
+              </p>
+            </div>
 
-            {!runResult ? (
-              <EmptyState
-                title="No decision yet"
-                subtitle="Create a work item, then click “Run Orchestration” to see the decision panel."
-              />
-            ) : (
-              <div className="mt-5 space-y-5">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${decisionBadgeClasses(runResult.decision)}`}>
-                      {runResult.decision}
-                    </span>
-                    <span className="text-sm text-slate-300">
-                      Status: <span className="text-slate-100">{runResult.new_status}</span>
-                    </span>
-                  </div>
+            <div className="flex gap-2">
+              <button
+                onClick={onRunSimulations}
+                disabled={metricsBusy}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-100 hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {metricsBusy ? "Working..." : "Run Simulations"}
+              </button>
 
-                  <div className="flex items-center gap-3">
-                    <span className="text-sm text-slate-300">Confidence</span>
-                    <span className="rounded-full bg-white/5 px-3 py-1 text-sm font-semibold text-slate-100 ring-1 ring-white/10">
-                      {fmtPct(runResult.confidence)}
-                    </span>
-                  </div>
+              <button
+                onClick={onRefreshMetrics}
+                disabled={metricsBusy}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm text-slate-100 hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Refresh
+              </button>
+
+              <button
+                onClick={onResetMetrics}
+                disabled={metricsBusy}
+                className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-100 hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Reset
+              </button>
+            </div>
+          </div>
+
+          {metricsError && (
+            <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm">
+              <span className="font-semibold text-red-200">Metrics Error:</span>{" "}
+              <span className="text-red-100">{metricsError}</span>
+            </div>
+          )}
+
+          <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-5">
+            <MetricCard title="Total" value={metrics ? String(metrics.total) : "—"} />
+            <MetricCard title="Auto Resolved" value={metrics ? String(metrics.auto_resolved) : "—"} />
+            <MetricCard title="Escalated" value={metrics ? String(metrics.escalated) : "—"} />
+            <MetricCard title="Auto Resolve Rate" value={metrics ? fmtPct(num(metrics.auto_resolve_rate)) : "—"} />
+            <MetricCard title="Escalation Rate" value={metrics ? fmtPct(num(metrics.escalation_rate)) : "—"} />
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
+              <div className="text-sm font-semibold">Override Breakdown</div>
+              <div className="mt-1 text-xs text-slate-400">How often overrides were used (NONE, PRIORITY_FLAG, etc.)</div>
+
+              {!metrics ? (
+                <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
+                  Run simulations or refresh to load metrics.
                 </div>
-
-                <div>
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>Low</span>
-                    <span>High</span>
-                  </div>
-                  <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-white/10">
-                    <div
-                      className={`h-full ${confidenceBarClasses(runResult.confidence)}`}
-                      style={{ width: `${Math.round(clamp01(runResult.confidence) * 100)}%` }}
-                    />
-                  </div>
+              ) : overrideBreakdownEntries.length === 0 ? (
+                <div className="mt-4 text-sm text-slate-300">No override breakdown returned.</div>
+              ) : (
+                <div className="mt-4 space-y-2">
+                  {overrideBreakdownEntries.map(([k, v]) => (
+                    <div key={k} className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-950/40 px-4 py-3">
+                      <span className="text-sm text-slate-200">{k}</span>
+                      <span className="text-sm font-semibold text-slate-100">{v}</span>
+                    </div>
+                  ))}
                 </div>
+              )}
+            </div>
 
-                <div className="rounded-xl border border-white/10 bg-white/5 p-4">
-                  <div className="text-sm font-semibold text-slate-100">Reason</div>
-                  <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-200/90">
-                    {runResult.reason}
-                  </p>
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
+              <div className="text-sm font-semibold">Notes</div>
+              <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-slate-300">
+                <li>Simulations typically aggregate outcomes from created work items (or synthetic runs, depending on backend).</li>
+                <li>If you reset metrics, it clears stored simulation artifacts, then report becomes zeros/empty.</li>
+                <li>If buttons don’t appear, it usually means you’re not running this file or TS compile failed.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        {/* Explainability */}
+        {trace && (
+          <section className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+            {/* Agent cards */}
+            <div className="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+              <div className="flex items-center justify-between">
+                <h2 className="text-base font-semibold">2) Explainability</h2>
+                <span className="text-xs text-slate-400">
+                  {agentTrace?.length ? `${agentTrace.length} agents` : "No agent trace"}
+                </span>
+              </div>
+
+              {!agentTrace?.length ? (
+                <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
+                  No agent trace found in context.
                 </div>
+              ) : (
+                <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
+                  {agentTrace.map((a, idx) => {
+                    const score = clamp01(Number(a.score ?? 0));
+                    return (
+                      <div
+                        key={`${a.name}-${idx}`}
+                        className="rounded-2xl border border-slate-800 bg-slate-950/40 p-5"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-100">{a.name}</div>
+                            <div className="mt-1 text-xs text-slate-400">Recommendation</div>
+                          </div>
 
-                {finalSummary && (
-                  <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-                    <Metric label="Final Decision" value={finalSummary.decision || runResult.decision} />
-                    <Metric
-                      label="Avg Score"
-                      value={typeof finalSummary.avg_score === "number" ? finalSummary.avg_score.toFixed(3) : "—"}
-                    />
-                    <Metric
-                      label="Override"
-                      value={finalSummary.override ? String(finalSummary.override) : "NONE"}
-                    />
+                          <span
+                            className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium ${recBadge(a.recommendation)}`}
+                          >
+                            {String(a.recommendation || "UNKNOWN")}
+                          </span>
+                        </div>
+
+                        <div className="mt-4">
+                          <div className="flex items-center justify-between text-xs text-slate-400">
+                            <span>Score</span>
+                            <span className="text-slate-200">{fmtPct(score)}</span>
+                          </div>
+
+                          <div className="mt-2 h-2 w-full rounded-full bg-slate-800">
+                            <div
+                              className={`h-2 rounded-full ${scoreBarColor(score)}`}
+                              style={{ width: `${Math.round(score * 100)}%` }}
+                            />
+                          </div>
+
+                          <div className="mt-4 text-xs text-slate-400">Reason</div>
+                          <div className="mt-1 text-sm text-slate-200">{a.reason || "No reason provided."}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Decision summary + history */}
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+              <h2 className="text-base font-semibold">3) Audit</h2>
+
+              <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <div className="text-xs uppercase tracking-wide text-slate-400">Final summary</div>
+                <div className="mt-3 space-y-2 text-sm">
+                  <Row k="Decision" v={finalSummary?.decision || runResult?.decision || "—"} />
+                  <Row k="Override" v={finalSummary?.override || "NONE"} />
+                  <Row
+                    k="Avg score"
+                    v={typeof finalSummary?.avg_score === "number" ? finalSummary.avg_score.toFixed(3) : "—"}
+                  />
+                  <Row
+                    k="Votes escalate"
+                    v={typeof finalSummary?.votes_escalate === "number" ? String(finalSummary.votes_escalate) : "—"}
+                  />
+                  <Row
+                    k="Weighted score"
+                    v={
+                      typeof finalSummary?.weighted_escalate_score === "number"
+                        ? String(finalSummary.weighted_escalate_score)
+                        : "—"
+                    }
+                  />
+                </div>
+              </div>
+
+              <div className="mt-5">
+                <div className="text-xs uppercase tracking-wide text-slate-400">Decisions history</div>
+
+                {!trace.decisions?.length ? (
+                  <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
+                    No decisions found.
+                  </div>
+                ) : (
+                  <div className="mt-3 space-y-3">
+                    {trace.decisions.map((d) => {
+                      const dec = (d.decision || "").toUpperCase();
+                      return (
+                        <div key={d.id} className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <span className={`rounded-full border px-3 py-1 text-xs font-medium ${decisionBadge(dec)}`}>
+                              {dec || "UNKNOWN"}
+                            </span>
+
+                            <div className="text-right text-xs text-slate-400">
+                              <div>{new Date(d.created_at).toLocaleString()}</div>
+                              <div>{d.created_by ? `by ${d.created_by}` : "system"}</div>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 text-xs text-slate-400">Reason</div>
+                          <div className="mt-1 text-sm text-slate-200">{d.reason}</div>
+
+                          <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
+                            <span>Confidence</span>
+                            <span className="text-slate-200">{fmtPct(Number(d.confidence || 0))}</span>
+                          </div>
+                          <div className="mt-2 h-2 w-full rounded-full bg-slate-800">
+                            <div
+                              className={`h-2 rounded-full ${scoreBarColor(Number(d.confidence || 0))}`}
+                              style={{ width: `${Math.round(clamp01(Number(d.confidence || 0)) * 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
-            )}
-          </Card>
-
-          <Card className="mt-6">
-            <CardHeader title="Agent Trace" subtitle="How each agent voted and why." />
-
-            {agentTrace.length === 0 ? (
-              <EmptyState title="No trace yet" subtitle="Run orchestration to see multi-agent reasoning." />
-            ) : (
-              <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
-                {agentTrace.map((a) => (
-                  <div
-                    key={`${a.name}-${a.recommendation}-${a.score}`}
-                    className="rounded-xl border border-white/10 bg-white/5 p-4"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="text-sm font-semibold text-slate-100">{a.name}</div>
-                        <div className="mt-1 text-xs text-slate-400">
-                          Score: <span className="text-slate-200">{Number(a.score).toFixed(3)}</span>
-                        </div>
-                      </div>
-
-                      <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${recChipClasses(a.recommendation)}`}>
-                        {a.recommendation}
-                      </span>
-                    </div>
-
-                    <div className="mt-3 text-sm text-slate-200/90">
-                      <div className="text-xs font-semibold text-slate-300">Reason</div>
-                      <div className="mt-1 whitespace-pre-wrap leading-6">{a.reason}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-
-          <Card className="mt-6">
-            <CardHeader title="Decision History" subtitle="Every run is stored as a decision record." />
-
-            {!trace?.decisions?.length ? (
-              <EmptyState title="No decision records" subtitle="Run orchestration to generate decision history." />
-            ) : (
-              <div className="mt-5 space-y-3">
-                {trace.decisions
-                  .slice()
-                  .reverse()
-                  .map((d) => (
-                    <div
-                      key={d.id}
-                      className="rounded-xl border border-white/10 bg-white/5 p-4"
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="flex items-center gap-2">
-                          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${decisionBadgeClasses(d.decision)}`}>
-                            {d.decision}
-                          </span>
-                          <span className="text-xs text-slate-400 font-mono break-all">{d.id}</span>
-                        </div>
-                        <div className="text-xs text-slate-400">
-                          {new Date(d.created_at).toLocaleString()}
-                        </div>
-                      </div>
-
-                      <div className="mt-3 text-sm text-slate-200/90">
-                        <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                          <span>
-                            Confidence: <span className="text-slate-200">{fmtPct(d.confidence)}</span>
-                          </span>
-                          <span>
-                            Reviewer: <span className="text-slate-200">{d.created_by ?? "system"}</span>
-                          </span>
-                        </div>
-
-                        <div className="mt-2 whitespace-pre-wrap leading-6">{d.reason}</div>
-                      </div>
-                    </div>
-                  ))}
-              </div>
-            )}
-          </Card>
-        </section>
+            </div>
+          </section>
+        )}
       </div>
-
-      <footer className="border-t border-white/10 py-6">
-        <div className="mx-auto max-w-6xl px-6 text-xs text-slate-400">
-          Tip: This page is intentionally built without extra UI libraries. We can add shadcn/ui later if you want.
-        </div>
-      </footer>
     </main>
   );
 }
 
-/* ---------------------- UI Components ---------------------- */
-
-function Card(props: { children: React.ReactNode; className?: string }) {
+function MetricCard({ title, value }: { title: string; value: string }) {
   return (
-    <div className={`rounded-2xl border border-white/10 bg-slate-950/40 p-5 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] ${props.className || ""}`}>
-      {props.children}
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
+      <div className="text-xs uppercase tracking-wide text-slate-400">{title}</div>
+      <div className="mt-2 text-2xl font-semibold text-slate-100">{value}</div>
     </div>
   );
 }
 
-function CardHeader(props: { title: string; subtitle: string }) {
+function Row({ k, v }: { k: string; v: string }) {
   return (
-    <div>
-      <div className="text-lg font-semibold text-slate-100">{props.title}</div>
-      <div className="mt-1 text-sm text-slate-300">{props.subtitle}</div>
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-slate-400">{k}</span>
+      <span className="font-medium text-slate-100">{v}</span>
     </div>
   );
 }
 
-function EmptyState(props: { title: string; subtitle: string }) {
+function TextInput(props: { label: string; value: string; onChange: (v: string) => void }) {
   return (
-    <div className="mt-5 rounded-xl border border-dashed border-white/10 bg-white/5 p-6">
-      <div className="text-sm font-semibold text-slate-100">{props.title}</div>
-      <div className="mt-1 text-sm text-slate-300">{props.subtitle}</div>
-    </div>
-  );
-}
-
-function Metric(props: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+    <label className="block">
       <div className="text-xs text-slate-400">{props.label}</div>
-      <div className="mt-1 text-lg font-semibold text-slate-100">{props.value}</div>
-    </div>
-  );
-}
-
-function TextField(props: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <label className="space-y-2">
-      <div className="text-xs font-medium text-slate-300">{props.label}</div>
       <input
-        className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-indigo-400/40 focus:ring-2 focus:ring-indigo-500/20"
         value={props.value}
         onChange={(e) => props.onChange(e.target.value)}
+        className="mt-2 w-full rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none focus:border-indigo-500/60"
+        placeholder={props.label}
       />
     </label>
   );
 }
 
-function NumberField(props: { label: string; value: number; onChange: (v: number) => void }) {
+function NumberInput(props: { label: string; value: number; onChange: (v: number) => void }) {
   return (
-    <label className="space-y-2">
-      <div className="text-xs font-medium text-slate-300">{props.label}</div>
+    <label className="block">
+      <div className="text-xs text-slate-400">{props.label}</div>
       <input
         type="number"
-        className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-indigo-400/40 focus:ring-2 focus:ring-indigo-500/20"
         value={props.value}
         onChange={(e) => props.onChange(Number(e.target.value))}
+        className="mt-2 w-full rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none focus:border-indigo-500/60"
+        placeholder={props.label}
       />
     </label>
   );
@@ -493,50 +633,26 @@ function NumberField(props: { label: string; value: number; onChange: (v: number
 
 function Toggle(props: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-3">
+    <div className="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/40 px-4 py-3">
       <div>
-        <div className="text-xs font-semibold text-slate-200">{props.label}</div>
-        <div className="text-xs text-slate-400">Escalate priority shipments regardless of other signals.</div>
+        <div className="text-sm font-medium text-slate-100">{props.label}</div>
+        <div className="text-xs text-slate-400">If true, priority override can force escalation.</div>
       </div>
 
       <button
         type="button"
         onClick={() => props.onChange(!props.checked)}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
-          props.checked ? "bg-indigo-500/80" : "bg-white/10"
+        className={`relative inline-flex h-7 w-12 items-center rounded-full border transition ${
+          props.checked ? "border-emerald-500/40 bg-emerald-500/20" : "border-slate-700 bg-slate-900"
         }`}
         aria-pressed={props.checked}
       >
         <span
-          className={`inline-block h-5 w-5 transform rounded-full bg-white transition ${
-            props.checked ? "translate-x-5" : "translate-x-1"
+          className={`inline-block h-5 w-5 transform rounded-full transition ${
+            props.checked ? "translate-x-6 bg-emerald-400" : "translate-x-1 bg-slate-400"
           }`}
         />
       </button>
     </div>
-  );
-}
-
-function PrimaryButton(props: { children: React.ReactNode; onClick: () => void; disabled?: boolean }) {
-  return (
-    <button
-      onClick={props.onClick}
-      disabled={props.disabled}
-      className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-60"
-    >
-      {props.children}
-    </button>
-  );
-}
-
-function SecondaryButton(props: { children: React.ReactNode; onClick: () => void; disabled?: boolean }) {
-  return (
-    <button
-      onClick={props.onClick}
-      disabled={props.disabled}
-      className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-    >
-      {props.children}
-    </button>
   );
 }

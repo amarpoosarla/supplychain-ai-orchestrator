@@ -407,3 +407,72 @@ def simulations_reset(db: Session = Depends(get_db)):
         "deleted_work_items": deleted_work_items,
         "deleted_decisions": deleted_decisions,
     }
+
+@router.post("/simulate")
+def simulate(db: Session = Depends(get_db)):
+    """
+    Runs a fixed scenario set through the orchestrator and stores results.
+    Returns business metrics to tell a strong story in interviews.
+    """
+    results = []
+    auto_resolved = 0
+    escalated = 0
+
+    for ev in SCENARIOS:
+        out = orchestrate(ev, db)
+
+        decision = out["decision"]
+        status = "AUTO_RESOLVED" if decision == "AUTO_RESOLVE" else "ESCALATED"
+
+        if status == "AUTO_RESOLVED":
+            auto_resolved += 1
+        else:
+            escalated += 1
+
+        wi = WorkItem(
+            type="SHIPMENT_DELAY",
+            status=status,
+            payload=ev,
+            context=out["context"],
+        )
+        db.add(wi)
+        db.flush()
+
+        d = Decision(
+            work_item_id=wi.id,
+            decision=decision,
+            reason=out["reason"],
+            confidence=float(out["confidence"]),
+        )
+        db.add(d)
+
+        results.append(
+            {
+                "work_item_id": str(wi.id),
+                "shipment_id": ev["shipment_id"],
+                "status": status,
+                "decision": decision,
+                "confidence": out["confidence"],
+                "votes_escalate": out["context"]["final"].get("votes_escalate", 0),
+                "override": out["context"]["final"].get("override", "NONE"),
+            }
+        )
+
+    db.commit()
+
+    total = len(SCENARIOS)
+    auto_rate = round(auto_resolved / total, 3) if total else 0.0
+    esc_rate = round(escalated / total, 3) if total else 0.0
+
+    minutes_saved = auto_resolved * 15
+    hours_saved = round(minutes_saved / 60.0, 2)
+
+    return {
+        "total": total,
+        "auto_resolved": auto_resolved,
+        "escalated": escalated,
+        "auto_resolve_rate": auto_rate,
+        "escalation_rate": esc_rate,
+        "estimated_hours_saved_per_run": hours_saved,
+        "items": results,
+    }

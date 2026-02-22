@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.health import router as health_router
 from app.api.routes.work_items import router as work_items_router
 from app.api.routes.knowledge import router as knowledge_router
+from app.api.routes.portfolio import router as portfolio_router
+
 
 from app.db.session import init_db
 
@@ -27,6 +29,7 @@ def _startup():
 app.include_router(health_router)
 app.include_router(work_items_router)
 app.include_router(knowledge_router)   # 👈 THIS LINE IS REQUIRED
+app.include_router(portfolio_router)
 
 
 @app.get("/version", tags=["meta"])
