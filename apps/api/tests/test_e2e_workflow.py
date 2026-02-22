@@ -75,14 +75,15 @@ def test_multi_agent_orchestrator_trace(event, expected_status, expected_reason_
     # validate agent trace
     agent_trace = ctx["agent_trace"]
     assert isinstance(agent_trace, list)
-    assert len(agent_trace) == 3
+    assert len(agent_trace) == 4
+
     names = sorted([a["name"] for a in agent_trace])
-    assert names == ["CostAgent", "RiskAgent", "SlaAgent"]
+    assert names == ["CostAgent", "LlmDecisionAgent", "RiskAgent", "SlaAgent"]
 
     # validate final summary exists
     final = ctx["final"]
     assert "decision" in final
-    assert "votes_escalate" in final
+    assert "weighted_escalate_score" in final
     assert "avg_score" in final
 
     # validate decision record reason formatting
