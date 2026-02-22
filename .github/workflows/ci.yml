@@ -18,13 +18,13 @@ jobs:
       - name: Build and start services
         working-directory: infra/local
         run: |
-          docker compose up --build -d
+          docker compose up --build -d postgres api
           docker compose ps
 
       - name: Run tests
         working-directory: infra/local
         run: |
-          docker compose exec -T api pytest -q /app/tests/test_e2e_workflow.py
+          docker compose exec -T api pytest -q /app/tests/test_e2e_workflow.py --maxfail=1
 
       - name: Show logs on failure
         if: failure()
