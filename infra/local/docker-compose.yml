@@ -20,7 +20,8 @@ services:
       context: ../../apps/api
     environment:
       DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/appdb
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DISABLE_LLM: ${DISABLE_LLM:-1}
     ports:
       - "8000:8000"
     depends_on:
