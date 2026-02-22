@@ -8,33 +8,42 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: supplychain
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d supplychain"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # IMPORTANT: match what SQLAlchemy expects in your app
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/supplychain
+      # Your tests shouldn’t require a real OpenAI key.
+      # If they do, set it as a GitHub Secret instead.
+      OPENAI_API_KEY: ""
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Build and start services
-        working-directory: infra/local
+      - name: Install dependencies
         run: |
-          docker compose up --build -d postgres api
-          docker compose ps
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run tests
-        working-directory: infra/local
         run: |
-          docker compose exec -T api pytest -q /app/tests/test_e2e_workflow.py --maxfail=1
-
-      - name: Show logs on failure
-        if: failure()
-        working-directory: infra/local
-        run: |
-          docker compose logs --no-color --tail=200 api
-          docker compose logs --no-color --tail=200 postgres
-
-      - name: Shutdown
-        if: always()
-        working-directory: infra/local
-        run: |
-          docker compose down -v
+          pytest -q /app/tests/test_e2e_workflow.py || pytest -q tests/test_e2e_workflow.py
