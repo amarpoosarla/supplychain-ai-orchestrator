@@ -16,7 +16,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","https://supplychain-ai-orchestrator.onrender.com"],  # Next.js dev server
+    allow_origins=["http://localhost:3000","https://supplychain-ai-orchestrator.onrender.com","https://supplychain-ai-orchestrator-frontend.onrender.com"],  # Next.js dev server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,6 +24,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
+/*************  ✨ Windsurf Command ⭐  *************/
+    """
+    Initializes the database connection using init_db()
+    """
+/*******  9eca4494-cab2-4382-98da-528554f37649  *******/
     init_db()
 
 app.include_router(health_router)
