@@ -1,90 +1,76 @@
+from sqlalchemy.orm import Session
 from app.core.agents import RiskAgent, CostAgent, SlaAgent, AgentResult
+from app.ai.llm_agent import LlmDecisionAgent
 
 
-def orchestrate(event: dict) -> dict:
-    agents = [RiskAgent(), CostAgent(), SlaAgent()]
-    results: list[AgentResult] = [a.evaluate(event) for a in agents]
+def orchestrate(event: dict, db: Session) -> dict:
+    """
+    Hybrid orchestration:
+    - Deterministic agents (Risk, Cost, SLA)
+    - LLM RAG agent
+    - Hard overrides
+    - Voting logic
+    """
 
-    # Hard override 1: priority shipments must escalate
+    deterministic_agents = [RiskAgent(), CostAgent(), SlaAgent()]
+    llm_agent = LlmDecisionAgent()
+
+    results: list[AgentResult] = []
+
+    # Run deterministic agents
+    for agent in deterministic_agents:
+        results.append(agent.evaluate(event))
+
+    # Run LLM agent
+    llm_result = llm_agent.evaluate(event, db)
+    results.append(
+        AgentResult(
+            name=llm_result["name"],
+            recommendation=llm_result["recommendation"],
+            reason=llm_result["reason"],
+            score=llm_result["score"],
+        )
+    )
+
+    # =============================
+    # HARD OVERRIDE 1: PRIORITY
+    # =============================
     if bool(event.get("priority_flag", False)):
-        avg_score = sum(r.score for r in results) / len(results)
+        return _override_response(results, "PRIORITY_FLAG")
 
-        key_reasons = [r.reason for r in results if r.recommendation == "ESCALATE"]
-        reason = "Escalated because: priority shipment (priority_flag=true)"
-        if key_reasons:
-            reason += " | " + " | ".join(key_reasons)
-
-        context = {
-            "agent_trace": [
-                {
-                    "name": r.name,
-                    "score": r.score,
-                    "recommendation": r.recommendation,
-                    "reason": r.reason,
-                }
-                for r in results
-            ],
-            "final": {
-                "decision": "ESCALATE",
-                "votes_escalate": len(results),
-                "avg_score": avg_score,
-                "override": "PRIORITY_FLAG",
-            },
-        }
-
-        return {
-            "decision": "ESCALATE",
-            "reason": reason,
-            "confidence": 1.0,
-            "context": context,
-        }
-
-    # Hard override 2: very high value orders must escalate
+    # =============================
+    # HARD OVERRIDE 2: HIGH VALUE
+    # =============================
     order_value = float(event.get("order_value", 0.0))
     if order_value >= 100000:
-        avg_score = sum(r.score for r in results) / len(results)
+        return _override_response(results, "HIGH_ORDER_VALUE")
 
-        key_reasons = [r.reason for r in results if r.recommendation == "ESCALATE"]
-        reason = f"Escalated because: high order value (order_value={order_value})"
-        if key_reasons:
-            reason += " | " + " | ".join(key_reasons)
+    # =============================
+    # HYBRID VOTING LOGIC
+    # =============================
 
-        context = {
-            "agent_trace": [
-                {
-                    "name": r.name,
-                    "score": r.score,
-                    "recommendation": r.recommendation,
-                    "reason": r.reason,
-                }
-                for r in results
-            ],
-            "final": {
-                "decision": "ESCALATE",
-                "votes_escalate": len(results),
-                "avg_score": avg_score,
-                "override": "HIGH_ORDER_VALUE",
-            },
-        }
+    # Weighted voting:
+    # Deterministic agents = 1 vote each
+    # LLM = 1.5 vote weight
+    escalate_score = 0.0
 
-        return {
-            "decision": "ESCALATE",
-            "reason": reason,
-            "confidence": 1.0,
-            "context": context,
-        }
+    for r in results:
+        if r.recommendation == "ESCALATE":
+            if r.name == "LlmDecisionAgent":
+                escalate_score += 1.5
+            else:
+                escalate_score += 1.0
 
-    # Normal voting rule: if 2+ agents say ESCALATE, escalate
-    escalate_votes = sum(1 for r in results if r.recommendation == "ESCALATE")
-    final_decision = "ESCALATE" if escalate_votes >= 2 else "AUTO_RESOLVE"
+    final_decision = "ESCALATE" if escalate_score >= 2 else "AUTO_RESOLVE"
 
     avg_score = sum(r.score for r in results) / len(results)
 
     key_reasons = [r.reason for r in results if r.recommendation == "ESCALATE"]
+
     if key_reasons:
         reason = "Escalated because: " + " | ".join(key_reasons)
     else:
-        reason = "Auto-resolved: all agents indicate low risk."
+        reason = "Auto-resolved: low combined risk across agents."
 
     context = {
         "agent_trace": [
@@ -98,7 +84,7 @@ def orchestrate(event: dict) -> dict:
         ],
         "final": {
             "decision": final_decision,
-            "votes_escalate": escalate_votes,
+            "weighted_escalate_score": escalate_score,
             "avg_score": avg_score,
         },
     }
@@ -108,4 +94,33 @@ def orchestrate(event: dict) -> dict:
         "reason": reason,
         "confidence": round(min(1.0, 0.5 + avg_score / 2), 3),
         "context": context,
+    }
+
+
+# =============================
+# OVERRIDE HELPER
+# =============================
+def _override_response(results: list[AgentResult], override_type: str) -> dict:
+    avg_score = sum(r.score for r in results) / len(results)
+
+    return {
+        "decision": "ESCALATE",
+        "reason": f"Escalated due to override: {override_type}",
+        "confidence": 1.0,
+        "context": {
+            "agent_trace": [
+                {
+                    "name": r.name,
+                    "score": r.score,
+                    "recommendation": r.recommendation,
+                    "reason": r.reason,
+                }
+                for r in results
+            ],
+            "final": {
+                "decision": "ESCALATE",
+                "override": override_type,
+                "avg_score": avg_score,
+            },
+        },
     }

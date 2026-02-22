@@ -90,7 +90,7 @@ def run_work_item(work_item_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="WorkItem not found")
 
     # ---- MULTI-AGENT ORCHESTRATION ----
-    out = orchestrate(wi.payload)
+    out = orchestrate(wi.payload, db)
 
     decision = out["decision"]
     reason = out["reason"]
@@ -218,8 +218,75 @@ def get_work_item_trace(work_item_id: str, db: Session = Depends(get_db)):
         ],
     )
 
-@router.post("/simulate")
-def simulate(db: Session = Depends(get_db)):
+@router.post("/{work_item_id}/run")
+def run_work_item(work_item_id: str, db: Session = Depends(get_db)):
+    try:
+        wi_uuid = uuid.UUID(work_item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid work_item_id")
+
+    wi = db.get(WorkItem, wi_uuid)
+    if not wi:
+        raise HTTPException(status_code=404, detail="WorkItem not found")
+
+    # --- IDPOTENCY GUARD ---
+    if wi.status in {
+        "AUTO_RESOLVED",
+        "ESCALATED",
+        "HUMAN_APPROVED",
+        "HUMAN_REJECTED",
+    }:
+        # fetch latest decision
+        last_decision = (
+            db.execute(
+                select(Decision)
+                .where(Decision.work_item_id == wi.id)
+                .order_by(Decision.created_at.desc())
+            )
+            .scalars()
+            .first()
+        )
+
+        return {
+            "work_item_id": str(wi.id),
+            "new_status": wi.status,
+            "decision": last_decision.decision if last_decision else None,
+            "reason": last_decision.reason if last_decision else "Already processed.",
+            "confidence": last_decision.confidence if last_decision else None,
+            "agent_summary": wi.context.get("final") if wi.context else None,
+            "idempotent": True,
+        }
+
+    # ---- MULTI-AGENT ORCHESTRATION ----
+    out = orchestrate(wi.payload, db)
+
+    decision = out["decision"]
+    reason = out["reason"]
+    confidence = float(out["confidence"])
+
+    wi.context = out["context"]
+    wi.status = "AUTO_RESOLVED" if decision == "AUTO_RESOLVE" else "ESCALATED"
+
+    d = Decision(
+        work_item_id=wi.id,
+        decision=decision,
+        reason=reason,
+        confidence=confidence,
+    )
+
+    db.add(d)
+    db.add(wi)
+    db.commit()
+
+    return {
+        "work_item_id": str(wi.id),
+        "new_status": wi.status,
+        "decision": decision,
+        "reason": reason,
+        "confidence": confidence,
+        "agent_summary": wi.context["final"],
+        "idempotent": False,
+    }
     """
     Runs a fixed scenario set through the orchestrator and stores results.
     Returns business metrics to tell a strong story in interviews.
@@ -229,7 +296,7 @@ def simulate(db: Session = Depends(get_db)):
     escalated = 0
 
     for ev in SCENARIOS:
-        out = orchestrate(ev)
+        out = orchestrate(ev, db)
 
         decision = out["decision"]
         status = "AUTO_RESOLVED" if decision == "AUTO_RESOLVE" else "ESCALATED"
@@ -262,7 +329,7 @@ def simulate(db: Session = Depends(get_db)):
                 "status": status,
                 "decision": decision,
                 "confidence": out["confidence"],
-                "votes_escalate": out["context"]["final"]["votes_escalate"],
+                "votes_escalate": out["context"]["final"].get("weighted_escalate_score"),
             }
         )
 
